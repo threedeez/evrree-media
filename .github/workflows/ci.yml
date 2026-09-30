@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Node 20 is the supported floor (package.json engines); 22 is what the other repos run.
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      # No cache: pnpm — same reasoning as evrree-ui's ci.yml.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Unit tests with coverage; fails under the 80% line threshold in vitest.config.ts.
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Dependency-isolation guard
+        run: pnpm check-lib-deps
+
+      # @evrree/media/client must bundle with --platform=browser (no Node built-ins, no AWS SDK).
+      - name: Browser bundle check
+        run: pnpm check-browser
+
+      # Packs the package, installs it into fresh CommonJS and ESM projects without NestJS,
+      # and requires/imports every entry point.
+      - name: CJS / ESM smoke test
+        run: pnpm smoke
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Start MinIO
+        run: pnpm minio:up
+
+      - name: Integration tests (MinIO)
+        run: pnpm test:integration
+
+      - name: MinIO logs
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs
+
+      - name: Stop MinIO
+        if: always()
+        run: pnpm minio:down

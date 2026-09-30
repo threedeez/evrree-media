@@ -1,0 +1,3 @@
+# Template for an app consuming @evrree/media — copy to .npmrc in the consuming repo.
+# Safe to commit: it only references an env var, never a literal token value.
+//registry.npmjs.org/:_authToken=${NPM_READ_TOKEN}
