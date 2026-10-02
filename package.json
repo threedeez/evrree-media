@@ -1,6 +1,6 @@
 {
   "name": "@evrree/media",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Storage-agnostic media SDK for Evrree apps: uploads, presigned browser uploads and signed URLs over S3-compatible storage.",
   "license": "UNLICENSED",
   "type": "module",
