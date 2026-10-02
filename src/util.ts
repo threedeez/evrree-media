@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { pipeline, Readable, Transform } from 'node:stream';
 import { abortedError, MediaError } from './errors';
 import type { MediaBody, UploadProgress } from './types';
 import { assertSize } from './validation';
@@ -97,63 +97,102 @@ export async function prepareBody(
     throw new MediaError('UPLOAD_FAILED', 'body must be a Buffer, Uint8Array, string, Blob or readable stream');
   }
 
-  const iterator = toReadable(body)[Symbol.asyncIterator]() as AsyncIterator<unknown>;
-  const peeked: Buffer[] = [];
-  let peekedLength = 0;
-  let ended = false;
-  while (peekedLength < opts.peekBytes) {
-    if (opts.signal?.aborted) {
-      await iterator.return?.();
-      throw abortedError();
-    }
-    const next = await iterator.next();
-    if (next.done) {
-      ended = true;
-      break;
-    }
-    const buf = chunkToBuffer(next.value);
-    peeked.push(buf);
-    peekedLength += buf.length;
-    if (peekedLength > opts.maxSizeBytes) {
-      await iterator.return?.();
-      assertSize(peekedLength, opts.maxSizeBytes);
-    }
-  }
-  const first = Buffer.concat(peeked);
-
-  if (ended) return { body: first, size: first.length, head: first.subarray(0, opts.peekBytes) };
-
-  async function* rest(): AsyncGenerator<Buffer> {
-    yield first;
-    for (;;) {
-      const next = await iterator.next();
-      if (next.done) return;
-      yield chunkToBuffer(next.value);
-    }
-  }
+  const stream = toReadable(body);
+  const { head, ended } = await peekStream(stream, opts.peekBytes, opts.maxSizeBytes, opts.signal);
+  if (ended) return { body: head, size: head.length, head: head.subarray(0, opts.peekBytes) };
   return {
-    body: limitStream(Readable.from(rest()), opts.maxSizeBytes, opts.signal),
-    head: first.subarray(0, opts.peekBytes),
+    body: limitStream(stream, opts.maxSizeBytes, opts.signal),
+    head: head.subarray(0, opts.peekBytes),
   };
+}
+
+function peekStream(
+  stream: Readable,
+  bytes: number,
+  maxSizeBytes: number,
+  signal?: AbortSignal,
+): Promise<{ head: Buffer; ended: boolean }> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let length = 0;
+
+    const cleanup = () => {
+      stream.off('readable', onReadable);
+      stream.off('end', onEnd);
+      stream.off('error', onError);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (error: unknown) => {
+      cleanup();
+      stream.destroy();
+      reject(error);
+    };
+    function onError(error: unknown) {
+      cleanup();
+      reject(error);
+    }
+    function onAbort() {
+      fail(abortedError(signal?.reason));
+    }
+    function onEnd() {
+      cleanup();
+      resolve({ head: Buffer.concat(chunks), ended: true });
+    }
+    function onReadable() {
+      let chunk: unknown;
+      while (length < bytes && (chunk = stream.read()) !== null) {
+        try {
+          const buf = chunkToBuffer(chunk);
+          chunks.push(buf);
+          length += buf.length;
+          assertSize(length, maxSizeBytes);
+        } catch (error) {
+          fail(error);
+          return;
+        }
+      }
+      if (length >= bytes) {
+        stream.off('readable', onReadable);
+        stream.off('end', onEnd);
+        signal?.removeEventListener('abort', onAbort);
+        const head = Buffer.concat(chunks);
+        stream.unshift(head);
+        resolve({ head, ended: false });
+      }
+    }
+
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    stream.on('readable', onReadable);
+    stream.on('end', onEnd);
+    stream.on('error', onError);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** Passes bytes through, erroring with FILE_TOO_LARGE past the limit and ABORTED on abort. */
 export function limitStream(source: Readable, maxSizeBytes: number, signal?: AbortSignal): Readable {
   let total = 0;
-  async function* limited(): AsyncGenerator<Buffer> {
-    try {
-      for await (const chunk of source) {
-        if (signal?.aborted) throw abortedError();
+  const limiter = new Transform({
+    writableObjectMode: true,
+    transform(chunk: unknown, _encoding, callback) {
+      try {
         const buf = chunkToBuffer(chunk);
         total += buf.length;
         assertSize(total, maxSizeBytes);
-        yield buf;
+        callback(null, buf);
+      } catch (error) {
+        callback(error as Error);
       }
-    } finally {
-      if (!source.destroyed) source.destroy();
-    }
-  }
-  return Readable.from(limited());
+    },
+  });
+  const onAbort = () => limiter.destroy(abortedError(signal?.reason));
+  pipeline(source, limiter, () => signal?.removeEventListener('abort', onAbort));
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
+  return limiter;
 }
 
 /** RFC 6266 Content-Disposition with an ASCII fallback and a UTF-8 filename*. */

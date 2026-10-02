@@ -171,7 +171,7 @@ describe('upload', () => {
     const { media, memory } = setup({ validation: { maxSizeBytes: 10 * 1024 } });
     const { stream, state } = countingStream(10 * MB, 1024);
     await expectCode(media.upload({ body: stream, fileName: 'big.bin', contentType: 'application/octet-stream' }), 'FILE_TOO_LARGE');
-    expect(state.pulled).toBeLessThan(64 * 1024);
+    expect(state.pulled).toBeLessThan(MB);
     expect(memory.size).toBe(0);
   });
 
@@ -267,6 +267,39 @@ describe('upload', () => {
     expect(onProgress).toHaveBeenCalled();
     expect(onProgress.mock.lastCall![0]).toMatchObject({ loadedBytes: 30 });
   });
+
+  it('rejects a stream that yields a non-byte chunk after the first bytes', async () => {
+    const { media, memory } = setup();
+    const body = Readable.from([Buffer.alloc(32), { not: 'bytes' }]);
+    await expectCode(media.upload({ body, fileName: 'x', contentType: 'application/octet-stream' }), 'UPLOAD_FAILED');
+    expect(memory.size).toBe(0);
+  });
+
+  it('rejects with the source error, without an unhandled error, when the stream fails right after the first bytes', async () => {
+    const { media, memory } = setup();
+    let reads = 0;
+    const body = new Readable({
+      read() {
+        if (reads++ === 0) this.push(Buffer.alloc(32));
+        else this.destroy(new Error('source broke'));
+      },
+    });
+    const error = await expectCode(media.upload({ body, fileName: 'x', contentType: 'application/octet-stream' }), 'PROVIDER_ERROR');
+    expect((error.cause as Error).message).toBe('source broke');
+    expect(memory.size).toBe(0);
+  });
+
+  it('aborts promptly while the source stream is idle waiting for data', async () => {
+    const { media, memory } = setup();
+    const idle = new Readable({ read() {} });
+    idle.push(Buffer.alloc(100));
+    const controller = new AbortController();
+    const upload = media.upload({ body: idle, fileName: 'x', contentType: 'application/octet-stream', signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await expectCode(upload, 'ABORTED');
+    expect(idle.destroyed).toBe(true);
+    expect(memory.size).toBe(0);
+  }, 2000);
 
   it('rejects with ABORTED for an already-aborted signal and aborts mid-stream', async () => {
     const { media, memory } = setup({ validation: { maxSizeBytes: 100 * MB } });

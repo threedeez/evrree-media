@@ -25,13 +25,21 @@ export function ensureBucket(): Promise<void> {
       forcePathStyle: true,
       credentials: s3Config.credentials,
     });
+    const deadline = Date.now() + 30_000;
     try {
-      await s3.send(new CreateBucketCommand({ Bucket: BUCKET }));
-    } catch (error) {
-      if (!(error instanceof BucketAlreadyOwnedByYou) && (error as Error).name !== 'BucketAlreadyExists') {
-        throw new Error(
-          `Could not reach MinIO at ${MINIO_ENDPOINT} (${(error as Error).message}). Start it with "pnpm minio:up".`,
-        );
+      for (;;) {
+        try {
+          await s3.send(new CreateBucketCommand({ Bucket: BUCKET }));
+          return;
+        } catch (error) {
+          if (error instanceof BucketAlreadyOwnedByYou || (error as Error).name === 'BucketAlreadyExists') return;
+          if (Date.now() > deadline) {
+            throw new Error(
+              `Could not reach MinIO at ${MINIO_ENDPOINT} (${(error as Error).message}). Start it with "pnpm minio:up".`,
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
       }
     } finally {
       s3.destroy();

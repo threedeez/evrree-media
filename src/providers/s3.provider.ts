@@ -12,7 +12,7 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { Readable } from 'node:stream';
+import { pipeline, Readable, Transform } from 'node:stream';
 import { abortedError, isAbortError, MediaError } from '../errors';
 import { encodeKeyForUrl } from '../keys';
 import type { MediaBody, S3ProviderConfig, Visibility } from '../types';
@@ -364,15 +364,24 @@ export function mapS3Error(error: unknown, key?: string): MediaError {
 function countBytes(source: Readable): { stream: Readable; onEnd: (fn: (total: number) => void) => void } {
   let total = 0;
   let done: ((total: number) => void) | undefined;
-  async function* counted(): AsyncGenerator<Buffer> {
-    for await (const chunk of source) {
-      const buf = Buffer.isBuffer(chunk) ? chunk : toBuffer(chunk as Uint8Array | string);
+  const counter = new Transform({
+    writableObjectMode: true,
+    transform(chunk: unknown, _encoding, callback) {
+      if (!Buffer.isBuffer(chunk) && !(chunk instanceof Uint8Array) && typeof chunk !== 'string') {
+        callback(new MediaError('UPLOAD_FAILED', 'Stream produced a chunk that is not bytes'));
+        return;
+      }
+      const buf = toBuffer(chunk);
       total += buf.length;
-      yield buf;
-    }
-    done?.(total);
-  }
-  return { stream: Readable.from(counted()), onEnd: (fn) => (done = fn) };
+      callback(null, buf);
+    },
+    flush(callback) {
+      done?.(total);
+      callback();
+    },
+  });
+  pipeline(source, counter, () => undefined);
+  return { stream: counter, onEnd: (fn) => (done = fn) };
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
